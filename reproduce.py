@@ -262,12 +262,90 @@ def rotate_left(values, shift: int, bits: int, full_mask: int):
     return ((values << shift) | (values >> (bits - shift))) & full_mask
 
 
+def carry_automaton_metrics(digits: list[int], base: int) -> dict:
+    """Build the reachable carry-subset automaton for an even base."""
+
+    assert base % 2 == 0
+    delta = {x - y for x in digits for y in digits}
+    balanced = tuple(range(-(base // 2), base // 2))
+
+    def transition(state: frozenset[int], epsilon: int) -> frozenset[int]:
+        return frozenset(
+            next_carry
+            for next_carry in (-1, 0, 1)
+            if any(
+                epsilon + carry - base * next_carry in delta for carry in state
+            )
+        )
+
+    initial = frozenset({0})
+    states = [initial]
+    cursor = 0
+    while cursor < len(states):
+        state = states[cursor]
+        cursor += 1
+        for epsilon in balanced:
+            next_state = transition(state, epsilon)
+            if next_state and next_state not in states:
+                states.append(next_state)
+
+    matrix = [[0 for _ in states] for _ in states]
+    for row, state in enumerate(states):
+        for epsilon in balanced:
+            next_state = transition(state, epsilon)
+            if next_state:
+                matrix[row][states.index(next_state)] += 1
+
+    # Perron iteration for the nonnegative transition matrix. Reachable
+    # carry automata here have positive diagonal entries, avoiding periodicity.
+    perron_vector = [1.0 for _ in states]
+    spectral_radius = 0.0
+    for _ in range(500):
+        next_vector = [
+            sum(matrix[row][col] * perron_vector[col] for col in range(len(states)))
+            for row in range(len(states))
+        ]
+        spectral_radius = max(next_vector)
+        assert spectral_radius > 0
+        perron_vector = [value / spectral_radius for value in next_vector]
+    counts = [1]
+    vector = [1 if state == initial else 0 for state in states]
+    for _ in range(8):
+        vector = [
+            sum(vector[row] * matrix[row][col] for row in range(len(states)))
+            for col in range(len(states))
+        ]
+        counts.append(sum(vector))
+
+    # Independently enumerate the first three digit products.
+    direct_counts = []
+    values = {0}
+    for j in range(4):
+        modulus = base**j
+        direct_counts.append(
+            len(modular_diffset(values, values, modulus)) if j else 1
+        )
+        assert direct_counts[-1] == counts[j]
+        values = {x + digit * modulus for x in values for digit in digits}
+
+    return {
+        "states": [sorted(state) for state in states],
+        "transition_matrix": matrix,
+        "spectral_radius": spectral_radius,
+        "normalized_growth": spectral_radius / base,
+        "t_0_to_8": counts,
+        "direct_t_0_to_3": direct_counts,
+    }
+
+
 def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
     import torch
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    base = 10 + pod_index * 8 + local_rank
+    # Both pods independently repeat the full sweep, so the leader's log
+    # contains all bases while the second node provides cross-node replication.
+    base = 12 + 2 * local_rank
     target_size = base // 2
     full_mask = (1 << base) - 1
     total_masks = 1 << base
@@ -276,6 +354,7 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
     best_diff = base + 1
     best_count = 0
     best_mask = None
+    best_masks: list[int] = []
     started = time.time()
 
     for start in range(0, total_masks, chunk):
@@ -316,12 +395,22 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
                 best_diff = chunk_min
                 best_count = count
                 best_mask = example
+                best_masks = [int(value) for value in winners.cpu().tolist()]
             else:
                 best_count += count
                 best_mask = min(best_mask, example)
+                best_masks.extend(int(value) for value in winners.cpu().tolist())
 
     torch.cuda.synchronize(device)
     example_set = [bit for bit in range(base) if (best_mask >> bit) & 1]
+    spectra = []
+    for mask in best_masks:
+        digits = [bit for bit in range(base) if (mask >> bit) & 1]
+        metrics = carry_automaton_metrics(digits, base)
+        spectra.append((metrics["normalized_growth"], digits, metrics))
+    spectra.sort(key=lambda item: (item[0], item[1]))
+    best_spectrum = spectra[0]
+    worst_spectrum = spectra[-1]
     result = {
         "pod_index": pod_index,
         "gpu": local_rank,
@@ -332,6 +421,12 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
         "minimum_difference_size": best_diff,
         "minimizer_count": best_count,
         "lexicographic_mask_example": example_set,
+        "best_carry_digits": best_spectrum[1],
+        "best_carry_automaton": best_spectrum[2],
+        "worst_normalized_growth": worst_spectrum[0],
+        "distinct_normalized_growth_values": len(
+            {round(item[0], 12) for item in spectra}
+        ),
         "seconds": time.time() - started,
         "device": torch.cuda.get_device_name(local_rank),
     }
@@ -417,6 +512,14 @@ def main() -> None:
         "exact_claim_groups_passed": 6,
         "theorem_K_values_checked": len(certificates),
         "gpu_moduli_checked": [row["base"] for row in gpu_rows],
+        "best_neighboring_gadget": min(
+            (
+                row["best_carry_automaton"]["normalized_growth"],
+                row["base"],
+                row["best_carry_digits"],
+            )
+            for row in gpu_rows
+        ),
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],
         "largest_C_certificate": certificates[-1]["C_certificate"],

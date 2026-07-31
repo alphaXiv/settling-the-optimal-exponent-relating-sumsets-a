@@ -19,6 +19,12 @@ It verifies:
 5. the integer lifting inequalities by direct enumeration of a toy instance;
 6. the theorem's quantitative bounds for a range of even `K`.
 
-The Kubernetes run also uses all 16 cluster GPUs for an independent exhaustive
-search over half-density digit gadgets in moduli 10 through 25. The search is
-split over two indexed pods with eight GPUs each.
+The baseline Kubernetes run also uses all 16 cluster GPUs for an independent
+exhaustive search over half-density digit gadgets in neighboring moduli.
+
+The carry-spectrum child goes further: it exhaustively finds every
+minimum-difference, full-sum half-density gadget in even bases 12 through 26,
+constructs the reachable carry-subset automaton for every minimizer, and ranks
+its Perron growth factor normalized by the base. Both eight-GPU nodes repeat
+the complete sweep, providing an independent cross-node replication while the
+leader prints the complete result table.
