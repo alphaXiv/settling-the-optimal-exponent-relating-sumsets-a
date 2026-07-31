@@ -44,3 +44,8 @@ The infinite-block child observes that both support counts are exactly affine
 in `h`. It measures the two intercepts with one exact FFT per construction,
 then evaluates arbitrarily large block widths and the closed-form
 `h -> infinity` exponent limit for substantially deeper/larger CRT cases.
+
+The parameter-frontier child drops the special restriction `s=2^K+1` and
+searches every odd `s` coprime to 12 up to ten million, for digit depths
+through 256. It evaluates the exact infinite-block formula on GPUs and
+rechecks the leading candidates with arbitrary-precision integers.

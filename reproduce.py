@@ -919,6 +919,151 @@ def run_infinite_block_audit(pod_index: int) -> list[dict]:
     return sorted(results, key=lambda row: (row["K"], row["d"]))
 
 
+def parameter_frontier_worker(local_rank: int, pod_index: int, result_queue) -> None:
+    import torch
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    maximum_s = 10_000_000
+    maximum_depth = 256
+    candidates = torch.arange(
+        5, maximum_s + 1, dtype=torch.int64, device=device
+    )
+    candidates = candidates[(candidates % 2 == 1) & (candidates % 3 != 0)]
+    s_values = candidates[local_rank::8].to(torch.float64)
+    q_values = s_values * s_values
+    rho_values = 2 * s_values - 1
+    top_rows = []
+    beta_values = [1.0, 11.0 / 12.0, 125.0 / (12.0**2)]
+    while len(beta_values) <= maximum_depth:
+        beta_values.append(
+            (14.0 / 12.0) * beta_values[-1]
+            - (31.0 / (12.0**2)) * beta_values[-2]
+            + (18.0 / (12.0**3)) * beta_values[-3]
+        )
+    started = time.time()
+    for depth in range(1, maximum_depth + 1):
+        beta = beta_values[depth]
+
+        alpha = (2 * s_values - 2) * (2.0 ** (-depth))
+        denominator = 1.0 + alpha
+        sigma = 2 * q_values / denominator
+        delta = (
+            2
+            * (rho_values + (q_values - rho_values) * beta)
+            / denominator
+        )
+        c_values = torch.log(sigma) / torch.log(delta)
+        values, indices = torch.topk(c_values, k=8)
+        for value, index in zip(values.cpu().tolist(), indices.cpu().tolist()):
+            s_integer = int(s_values[index].item())
+            top_rows.append(
+                {
+                    "replica": pod_index,
+                    "gpu": local_rank,
+                    "s": s_integer,
+                    "d": depth,
+                    "C_float": value,
+                    "sigma_float": float(sigma[index].item()),
+                    "delta_float": float(delta[index].item()),
+                    "log10_R": (
+                        depth * math.log10(12)
+                        + math.log10(float(denominator[index].item()))
+                    ),
+                }
+            )
+    top_rows.sort(key=lambda row: row["C_float"], reverse=True)
+    result = {
+        "replica": pod_index,
+        "gpu": local_rank,
+        "s_candidates": int(s_values.numel()),
+        "depths": maximum_depth,
+        "top": top_rows[:32],
+        "seconds": time.time() - started,
+        "device": torch.cuda.get_device_name(local_rank),
+    }
+    print("PARAMETER_SHARD_RESULT " + json.dumps(result, sort_keys=True), flush=True)
+    result_queue.put(result)
+
+
+def improved_t_values(maximum_depth: int) -> list[int]:
+    values = [1, 11, 125]
+    while len(values) <= maximum_depth:
+        values.append(
+            14 * values[-1] - 31 * values[-2] + 18 * values[-3]
+        )
+    return values[: maximum_depth + 1]
+
+
+def exact_frontier_row(row: dict, t_values: list[int]) -> dict:
+    s = row["s"]
+    depth = row["d"]
+    q_outer = s * s
+    rho = 2 * s - 1
+    n = 12**depth
+    r_size = n + (rho - 1) * 6**depth
+    modular_diff_count = rho * n + (q_outer - rho) * t_values[depth]
+    sigma = Fraction(2 * q_outer * n, r_size)
+    delta = Fraction(2 * modular_diff_count, r_size)
+    c_exact = math.log(float(sigma)) / math.log(float(delta))
+    assert abs(c_exact - row["C_float"]) < 1e-10
+    return {
+        **row,
+        "sigma_exact_float": float(sigma),
+        "delta_exact_float": float(delta),
+        "C_exact": c_exact,
+        "|R|_digits": len(str(r_size)),
+        "gcd_s_12": math.gcd(s, 12),
+    }
+
+
+def run_parameter_frontier(pod_index: int) -> list[dict]:
+    import torch
+
+    visible = torch.cuda.device_count()
+    assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=parameter_frontier_worker,
+            args=(rank, pod_index, result_queue),
+        )
+        for rank in range(visible)
+    ]
+    for process in processes:
+        process.start()
+    shard_results = []
+    while len(shard_results) < len(processes):
+        try:
+            shard_results.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            failed = [p.exitcode for p in processes if p.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"parameter-frontier worker failed: {failed}")
+            print(
+                f"PARAMETER_PROGRESS replica={pod_index} "
+                f"finished={len(shard_results)}/{len(processes)}",
+                flush=True,
+            )
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+
+    combined = [
+        row for shard in shard_results for row in shard["top"]
+    ]
+    combined.sort(key=lambda row: row["C_float"], reverse=True)
+    t_values = improved_t_values(256)
+    exact_top = [exact_frontier_row(row, t_values) for row in combined[:64]]
+    print(
+        "PARAMETER_FRONTIER_EXACT_TOP "
+        + json.dumps(exact_top, sort_keys=True),
+        flush=True,
+    )
+    return exact_top
+
+
 def main() -> None:
     pod_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
     print(
@@ -975,9 +1120,10 @@ def main() -> None:
         flush=True,
     )
 
-    block_rows = run_infinite_block_audit(pod_index)
+    frontier_rows = run_parameter_frontier(pod_index)
     print(
-        "INFINITE_BLOCK_SUMMARY " + json.dumps(block_rows, sort_keys=True),
+        "PARAMETER_FRONTIER_SUMMARY "
+        + json.dumps(frontier_rows, sort_keys=True),
         flush=True,
     )
 
@@ -993,14 +1139,10 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "infinite_block_cases_checked": len(block_rows),
-        "all_block_grids_monotone": all(
-            row["C_limit"] >= row["rows"][-1]["C"] for row in block_rows
-        ),
-        "best_limit_C": max(row["C_limit"] for row in block_rows),
-        "largest_limit_gain_over_h2": max(
-            row["gain_limit_over_h2"] for row in block_rows
-        ),
+        "parameter_s_max": 10_000_000,
+        "parameter_d_max": 256,
+        "frontier_best": frontier_rows[0],
+        "frontier_exact_rows": len(frontier_rows),
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],
         "largest_C_certificate": certificates[-1]["C_certificate"],
