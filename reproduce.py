@@ -343,21 +343,21 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    # Both pods independently repeat the full sweep, so the leader's log
-    # contains all bases while the second node provides cross-node replication.
-    base = 12 + 2 * local_rank
+    # Both pods independently repeat a disjoint eight-way partition of base 32.
+    base = 32
     target_size = base // 2
     full_mask = (1 << base) - 1
     total_masks = 1 << base
     chunk = 1 << 20
     additive_count = 0
+    normalized_count = 0
     best_diff = base + 1
     best_count = 0
     best_mask = None
     best_masks: list[int] = []
     started = time.time()
 
-    for start in range(0, total_masks, chunk):
+    for start in range(local_rank * chunk, total_masks, 8 * chunk):
         stop = min(total_masks, start + chunk)
         masks = torch.arange(start, stop, dtype=torch.int64, device=device)
         # Translation-normalize by requiring zero in W.
@@ -366,6 +366,7 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
         for bit in range(base):
             popcount += (masks >> bit) & 1
         masks = masks[keep & (popcount == target_size)]
+        normalized_count += int(masks.numel())
         if masks.numel() == 0:
             continue
 
@@ -395,11 +396,17 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
                 best_diff = chunk_min
                 best_count = count
                 best_mask = example
-                best_masks = [int(value) for value in winners.cpu().tolist()]
+                best_masks = [
+                    int(value) for value in winners[:4096].cpu().tolist()
+                ]
             else:
                 best_count += count
                 best_mask = min(best_mask, example)
-                best_masks.extend(int(value) for value in winners.cpu().tolist())
+                remaining = max(0, 4096 - len(best_masks))
+                best_masks.extend(
+                    int(value)
+                    for value in winners[:remaining].cpu().tolist()
+                )
 
     torch.cuda.synchronize(device)
     example_set = [bit for bit in range(base) if (best_mask >> bit) & 1]
@@ -416,10 +423,11 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
         "gpu": local_rank,
         "base": base,
         "subset_size": target_size,
-        "normalized_candidates": math.comb(base - 1, target_size - 1),
+        "normalized_candidates": normalized_count,
         "sum_full_candidates": additive_count,
         "minimum_difference_size": best_diff,
         "minimizer_count": best_count,
+        "carry_audited_minimizers": len(best_masks),
         "lexicographic_mask_example": example_set,
         "best_carry_digits": best_spectrum[1],
         "best_carry_automaton": best_spectrum[2],
@@ -505,20 +513,38 @@ def main() -> None:
 
     gpu_rows = run_gpu_search(pod_index)
     print("GPU_SEARCH_SUMMARY " + json.dumps(gpu_rows, sort_keys=True), flush=True)
+    global_minimum = min(row["minimum_difference_size"] for row in gpu_rows)
+    global_winners = [
+        row for row in gpu_rows
+        if row["minimum_difference_size"] == global_minimum
+    ]
+    assert sum(row["normalized_candidates"] for row in gpu_rows) == math.comb(
+        31, 15
+    )
 
     summary = {
         "status": "PASS",
         "pod_index": pod_index,
         "exact_claim_groups_passed": 6,
         "theorem_K_values_checked": len(certificates),
-        "gpu_moduli_checked": [row["base"] for row in gpu_rows],
+        "gpu_moduli_checked": [32],
+        "base32_normalized_candidates": sum(
+            row["normalized_candidates"] for row in gpu_rows
+        ),
+        "base32_sum_full_candidates": sum(
+            row["sum_full_candidates"] for row in gpu_rows
+        ),
+        "base32_minimum_difference_size": global_minimum,
+        "base32_minimizer_count": sum(
+            row["minimizer_count"] for row in global_winners
+        ),
         "best_neighboring_gadget": min(
             (
                 row["best_carry_automaton"]["normalized_growth"],
                 row["base"],
                 row["best_carry_digits"],
             )
-            for row in gpu_rows
+            for row in global_winners
         ),
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],

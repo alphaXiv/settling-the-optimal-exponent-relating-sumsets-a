@@ -28,3 +28,7 @@ constructs the reachable carry-subset automaton for every minimizer, and ranks
 its Perron growth factor normalized by the base. Both eight-GPU nodes repeat
 the complete sweep, providing an independent cross-node replication while the
 leader prints the complete result table.
+
+The base-32 child partitions all `2^32` masks across eight GPUs per replica,
+retains exact global minimizer counts, and carry-audits up to 4096
+deterministic minimum-difference representatives per shard.
