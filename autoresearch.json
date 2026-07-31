@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "paperId": "2607.27199",
+  "title": "Sumset–difference-set exponent reproduction",
+  "description": "Exact checks reproduce the paper's construction, while an improved digit gadget certifies exponent 1.999994956618507 with 31.8% less sufficient depth.",
+  "verdict": "reproduced",
+  "reportPath": "reproduction/report.md",
+  "notebookPath": "reproduction/notebook.py",
+  "compute": {
+    "backend": "kubernetes",
+    "gpuModel": "NVIDIA RTX PRO 6000 Blackwell",
+    "gpuCount": 16,
+    "wallHours": 11.8815
+  }
+}
