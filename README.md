@@ -71,3 +71,7 @@ constant if the optimized exponent converges to two at rate `1/d`.
 The asymptotic-constant child reaches depth 524288 and compares the measured
 scaled gap against `3 log(2) / -log(lambda/12)`, with `lambda` computed from
 the exact characteristic polynomial of the improved carry automaton.
+
+The million-depth child reaches depth 2097152.  Its GPU search uses the
+dominant-root log-growth model calibrated against an exact recurrence value,
+while the parent concurrently computes exact counts for every candidate depth.

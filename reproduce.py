@@ -1241,17 +1241,35 @@ def run_asymptotic_frontier(pod_index: int) -> dict:
     return result
 
 
-DEEP_CHECKPOINTS = frozenset({262144, 393216, 524288})
+DEEP_MAXIMUM = 2_097_152
+DEEP_CHECKPOINTS = frozenset({1_048_576, 1_572_864, DEEP_MAXIMUM})
 
 
-def predicted_scaled_gap_limit() -> float:
-    """Leading constant from the exact improved-gadget characteristic root."""
+def improved_perron_root() -> float:
+    """Largest root of x^3-14x^2+31x-18."""
     root = 11.4
     for _ in range(20):
         polynomial = root**3 - 14 * root**2 + 31 * root - 18
         derivative = 3 * root**2 - 28 * root + 31
         root -= polynomial / derivative
-    return 3 * math.log(2) / -math.log(root / 12)
+    return root
+
+
+def predicted_scaled_gap_limit() -> float:
+    """Leading constant from the exact improved-gadget characteristic root."""
+    return 3 * math.log(2) / -math.log(improved_perron_root() / 12)
+
+
+def perron_log_beta_model() -> tuple[float, float]:
+    """Calibrate log(beta_d)=intercept+d*slope against an exact deep count."""
+    calibration_depth = 4096
+    exact_count = improved_t_at_depths({calibration_depth})[calibration_depth]
+    slope = math.log(improved_perron_root() / 12)
+    exact_log_beta = (
+        log_bigint(exact_count) - calibration_depth * math.log(12)
+    )
+    intercept = exact_log_beta - calibration_depth * slope
+    return slope, intercept
 
 
 def improved_log_beta_values(maximum_depth: int) -> list[float]:
@@ -1288,16 +1306,17 @@ def improved_t_at_depths(depths: set[int]) -> dict[int, int]:
 def deep_scaling_worker(
     local_rank: int,
     pod_index: int,
-    log_beta_values: list[float],
+    log_beta_slope: float,
+    log_beta_intercept: float,
     result_queue,
 ) -> None:
     import torch
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    grid_size = 32_000_000
+    grid_size = 64_000_000
     full_grid = torch.linspace(
-        6200.0, 26000.0, grid_size, dtype=torch.float64, device=device
+        25000.0, 104000.0, grid_size, dtype=torch.float64, device=device
     )
     log_s_values = full_grid[local_rank::8]
 
@@ -1305,8 +1324,8 @@ def deep_scaling_worker(
     checkpoints = []
     log_two = math.log(2)
     started = time.time()
-    for depth in range(131073, 524289):
-        log_beta = log_beta_values[depth]
+    for depth in range(524289, DEEP_MAXIMUM + 1):
+        log_beta = log_beta_intercept + depth * log_beta_slope
         # At log(s)>=90, replacing log(2s-2) by log(2s) and
         # log(s^2-2s+1) by 2log(s) changes less than 1e-38.
         log_alpha = log_two + log_s_values - depth * log_two
@@ -1337,7 +1356,7 @@ def deep_scaling_worker(
         "replica": pod_index,
         "gpu": local_rank,
         "log_s_samples": int(log_s_values.numel()),
-        "depth_count": 524288 - 131072,
+        "depth_count": DEEP_MAXIMUM - 524288,
         "top": best_rows[:16],
         "checkpoints": checkpoints,
         "seconds": time.time() - started,
@@ -1404,22 +1423,40 @@ def run_deep_scaling(pod_index: int) -> dict:
 
     visible = torch.cuda.device_count()
     assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    log_beta_slope, log_beta_intercept = perron_log_beta_model()
     print(
-        f"DEEP_SCALING_PRECOMPUTE replica={pod_index} max_depth=524288",
+        f"DEEP_SCALING_MODEL replica={pod_index} max_depth={DEEP_MAXIMUM} "
+        f"slope={log_beta_slope} intercept={log_beta_intercept}",
         flush=True,
     )
-    log_beta_values = improved_log_beta_values(524288)
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
     processes = [
         ctx.Process(
             target=deep_scaling_worker,
-            args=(rank, pod_index, log_beta_values, result_queue),
+            args=(
+                rank,
+                pod_index,
+                log_beta_slope,
+                log_beta_intercept,
+                result_queue,
+            ),
         )
         for rank in range(visible)
     ]
     for process in processes:
         process.start()
+    # The GPU sweep is long enough to hide this arbitrary-precision pass.
+    # The top candidates have been monotone in depth in every preceding run.
+    exact_depths = set(DEEP_CHECKPOINTS) | set(
+        range(DEEP_MAXIMUM - 80, DEEP_MAXIMUM + 1)
+    )
+    print(
+        f"EXACT_RECURRENCE_CONCURRENT replica={pod_index} "
+        f"targets={len(exact_depths)}",
+        flush=True,
+    )
+    t_values = improved_t_at_depths(exact_depths)
     shards = []
     while len(shards) < len(processes):
         try:
@@ -1449,10 +1486,10 @@ def run_deep_scaling(pod_index: int) -> dict:
         )
         for depth in sorted(DEEP_CHECKPOINTS)
     ]
-    exact_depths = {
+    reported_depths = {
         row["d"] for row in combined_top[:64] + checkpoint_winners
     }
-    t_values = improved_t_at_depths(exact_depths)
+    assert reported_depths <= exact_depths
     result = {
         "top": [
             exact_deep_row(row, t_values) for row in combined_top[:64]
@@ -1540,9 +1577,9 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "deep_d_max": 524288,
-        "deep_log_s_max": 26000.0,
-        "deep_grid_size": 32_000_000,
+        "deep_d_max": DEEP_MAXIMUM,
+        "deep_log_s_max": 104000.0,
+        "deep_grid_size": 64_000_000,
         "predicted_scaled_gap_limit": predicted_scaled_gap_limit(),
         "deep_best": deep_scaling["top"][0],
         "deep_checkpoints": deep_scaling["checkpoints"],
