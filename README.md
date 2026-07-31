@@ -67,3 +67,7 @@ the enormous admissible outer parameters with arbitrary-precision decimals.
 The convergence-constant child pushes to depth 131072 with a sixteen-million
 point grid and reports the scaled gap `d(2-C)`, which should approach a finite
 constant if the optimized exponent converges to two at rate `1/d`.
+
+The asymptotic-constant child reaches depth 524288 and compares the measured
+scaled gap against `3 log(2) / -log(lambda/12)`, with `lambda` computed from
+the exact characteristic polynomial of the improved carry automaton.

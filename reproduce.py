@@ -1241,7 +1241,17 @@ def run_asymptotic_frontier(pod_index: int) -> dict:
     return result
 
 
-DEEP_CHECKPOINTS = frozenset({65536, 98304, 131072})
+DEEP_CHECKPOINTS = frozenset({262144, 393216, 524288})
+
+
+def predicted_scaled_gap_limit() -> float:
+    """Leading constant from the exact improved-gadget characteristic root."""
+    root = 11.4
+    for _ in range(20):
+        polynomial = root**3 - 14 * root**2 + 31 * root - 18
+        derivative = 3 * root**2 - 28 * root + 31
+        root -= polynomial / derivative
+    return 3 * math.log(2) / -math.log(root / 12)
 
 
 def improved_log_beta_values(maximum_depth: int) -> list[float]:
@@ -1285,9 +1295,9 @@ def deep_scaling_worker(
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    grid_size = 16_000_000
+    grid_size = 32_000_000
     full_grid = torch.linspace(
-        1400.0, 6600.0, grid_size, dtype=torch.float64, device=device
+        6200.0, 26000.0, grid_size, dtype=torch.float64, device=device
     )
     log_s_values = full_grid[local_rank::8]
 
@@ -1295,7 +1305,7 @@ def deep_scaling_worker(
     checkpoints = []
     log_two = math.log(2)
     started = time.time()
-    for depth in range(32769, 131073):
+    for depth in range(131073, 524289):
         log_beta = log_beta_values[depth]
         # At log(s)>=90, replacing log(2s-2) by log(2s) and
         # log(s^2-2s+1) by 2log(s) changes less than 1e-38.
@@ -1327,7 +1337,7 @@ def deep_scaling_worker(
         "replica": pod_index,
         "gpu": local_rank,
         "log_s_samples": int(log_s_values.numel()),
-        "depth_count": 131072 - 32768,
+        "depth_count": 524288 - 131072,
         "top": best_rows[:16],
         "checkpoints": checkpoints,
         "seconds": time.time() - started,
@@ -1368,12 +1378,20 @@ def exact_deep_row(row: dict, t_values: list[int]) -> dict:
     )
     c_exact = log_sigma / log_delta
     assert abs(c_exact - row["C_float"]) < 1e-7
+    scaled_gap = depth * (2 - c_exact)
+    predicted_limit = predicted_scaled_gap_limit()
+    emit_s = s if s.bit_length() <= 14000 else None
     return {
         **row,
-        "s": s,
+        "s": emit_s,
+        "s_omitted_from_log": emit_s is None,
+        "s_digits": int(log_bigint(s) / math.log(10)) + 1,
+        "s_mod_12": s % 12,
         "C_exact": c_exact,
         "gap_to_2": 2 - c_exact,
-        "scaled_gap_d_times_2_minus_C": depth * (2 - c_exact),
+        "scaled_gap_d_times_2_minus_C": scaled_gap,
+        "predicted_scaled_gap_limit": predicted_limit,
+        "scaled_gap_residual": scaled_gap - predicted_limit,
         "log_sigma_exact": log_sigma,
         "log_delta_exact": log_delta,
         "|R|_digits": int(log_bigint(r_size) / math.log(10)) + 1,
@@ -1387,10 +1405,10 @@ def run_deep_scaling(pod_index: int) -> dict:
     visible = torch.cuda.device_count()
     assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
     print(
-        f"DEEP_SCALING_PRECOMPUTE replica={pod_index} max_depth=131072",
+        f"DEEP_SCALING_PRECOMPUTE replica={pod_index} max_depth=524288",
         flush=True,
     )
-    log_beta_values = improved_log_beta_values(131072)
+    log_beta_values = improved_log_beta_values(524288)
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
     processes = [
@@ -1522,9 +1540,10 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "deep_d_max": 131072,
-        "deep_log_s_max": 6600.0,
-        "deep_grid_size": 16_000_000,
+        "deep_d_max": 524288,
+        "deep_log_s_max": 26000.0,
+        "deep_grid_size": 32_000_000,
+        "predicted_scaled_gap_limit": predicted_scaled_gap_limit(),
         "deep_best": deep_scaling["top"][0],
         "deep_checkpoints": deep_scaling["checkpoints"],
         "paper_W_difference_size": 11,
