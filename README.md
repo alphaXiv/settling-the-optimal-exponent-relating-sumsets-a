@@ -32,3 +32,6 @@ leader prints the complete result table.
 The base-32 child partitions all `2^32` masks across eight GPUs per replica,
 retains exact global minimizer counts, and carry-audits up to 4096
 deterministic minimum-difference representatives per shard.
+
+The base-42 child applies the same replicated exhaustive protocol to all
+`2^42` masks with 21 selected digits.

@@ -343,8 +343,8 @@ def gpu_gadget_worker(local_rank: int, pod_index: int, result_queue) -> None:
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    # Both pods independently repeat a disjoint eight-way partition of base 32.
-    base = 32
+    # Both pods independently repeat a disjoint eight-way partition of base 42.
+    base = 42
     target_size = base // 2
     full_mask = (1 << base) - 1
     total_masks = 1 << base
@@ -519,7 +519,7 @@ def main() -> None:
         if row["minimum_difference_size"] == global_minimum
     ]
     assert sum(row["normalized_candidates"] for row in gpu_rows) == math.comb(
-        31, 15
+        41, 20
     )
 
     summary = {
@@ -527,15 +527,15 @@ def main() -> None:
         "pod_index": pod_index,
         "exact_claim_groups_passed": 6,
         "theorem_K_values_checked": len(certificates),
-        "gpu_moduli_checked": [32],
-        "base32_normalized_candidates": sum(
+        "gpu_moduli_checked": [42],
+        "base42_normalized_candidates": sum(
             row["normalized_candidates"] for row in gpu_rows
         ),
-        "base32_sum_full_candidates": sum(
+        "base42_sum_full_candidates": sum(
             row["sum_full_candidates"] for row in gpu_rows
         ),
-        "base32_minimum_difference_size": global_minimum,
-        "base32_minimizer_count": sum(
+        "base42_minimum_difference_size": global_minimum,
+        "base42_minimizer_count": sum(
             row["minimizer_count"] for row in global_winners
         ),
         "best_neighboring_gadget": min(
