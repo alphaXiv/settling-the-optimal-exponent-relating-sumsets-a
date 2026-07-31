@@ -1064,6 +1064,183 @@ def run_parameter_frontier(pod_index: int) -> list[dict]:
     return exact_top
 
 
+ASYMPTOTIC_CHECKPOINTS = frozenset({512, 1024, 1536, 2048})
+
+
+def asymptotic_frontier_worker(
+    local_rank: int, pod_index: int, result_queue
+) -> None:
+    import torch
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    grid_size = 200_000
+    log_grid = torch.linspace(
+        math.log(5), 100.0, grid_size, dtype=torch.float64, device=device
+    )
+    log_s_values = log_grid[local_rank::8]
+    s_values = torch.exp(log_s_values)
+    q_values = s_values * s_values
+    rho_values = 2 * s_values - 1
+    beta_values = [1.0, 11.0 / 12.0, 125.0 / (12.0**2)]
+    while len(beta_values) <= 2048:
+        beta_values.append(
+            (14.0 / 12.0) * beta_values[-1]
+            - (31.0 / (12.0**2)) * beta_values[-2]
+            + (18.0 / (12.0**3)) * beta_values[-3]
+        )
+
+    top_rows = []
+    checkpoint_rows = []
+    started = time.time()
+    for depth in range(257, 2049):
+        beta = beta_values[depth]
+        log_alpha = (
+            torch.log(2 * s_values - 2) - depth * math.log(2)
+        )
+        log_denominator = torch.nn.functional.softplus(log_alpha)
+        denominator = torch.exp(log_denominator)
+        sigma = 2 * q_values / denominator
+        delta = (
+            2
+            * (rho_values + (q_values - rho_values) * beta)
+            / denominator
+        )
+        c_values = torch.log(sigma) / torch.log(delta)
+        values, indices = torch.topk(c_values, k=4)
+        depth_rows = []
+        for value, index in zip(values.cpu().tolist(), indices.cpu().tolist()):
+            row = {
+                "replica": pod_index,
+                "gpu": local_rank,
+                "log_s": float(log_s_values[index].item()),
+                "s_float": float(s_values[index].item()),
+                "d": depth,
+                "C_float": value,
+                "sigma_float": float(sigma[index].item()),
+                "delta_float": float(delta[index].item()),
+            }
+            top_rows.append(row)
+            depth_rows.append(row)
+        if depth in ASYMPTOTIC_CHECKPOINTS:
+            checkpoint_rows.append(depth_rows[0])
+
+    top_rows.sort(key=lambda row: row["C_float"], reverse=True)
+    result = {
+        "replica": pod_index,
+        "gpu": local_rank,
+        "log_s_samples": int(log_s_values.numel()),
+        "depth_count": 2048 - 256,
+        "top": top_rows[:32],
+        "checkpoints": checkpoint_rows,
+        "seconds": time.time() - started,
+        "device": torch.cuda.get_device_name(local_rank),
+    }
+    print("ASYMPTOTIC_SHARD_RESULT " + json.dumps(result, sort_keys=True), flush=True)
+    result_queue.put(result)
+
+
+def nearest_admissible_s(s_float: float) -> int:
+    center = int(round(s_float))
+    candidates = [
+        value
+        for offset in range(-12, 13)
+        if (value := center + offset) >= 5
+        and value % 2 == 1
+        and value % 3 != 0
+    ]
+    assert candidates
+    return min(candidates, key=lambda value: abs(value - s_float))
+
+
+def exact_asymptotic_row(row: dict, t_values: list[int]) -> dict:
+    s = nearest_admissible_s(row["s_float"])
+    depth = row["d"]
+    q_outer = s * s
+    rho = 2 * s - 1
+    n = 12**depth
+    r_size = n + (rho - 1) * 6**depth
+    modular_diff_count = rho * n + (q_outer - rho) * t_values[depth]
+    sigma = Fraction(2 * q_outer * n, r_size)
+    delta = Fraction(2 * modular_diff_count, r_size)
+    c_exact = math.log(float(sigma)) / math.log(float(delta))
+    assert abs(c_exact - row["C_float"]) < 1e-7
+    return {
+        **row,
+        "s": s,
+        "C_exact": c_exact,
+        "sigma_exact_float": float(sigma),
+        "delta_exact_float": float(delta),
+        "gap_to_2": 2 - c_exact,
+        "|R|_digits": len(str(r_size)),
+        "gcd_s_12": math.gcd(s, 12),
+    }
+
+
+def run_asymptotic_frontier(pod_index: int) -> dict:
+    import torch
+
+    visible = torch.cuda.device_count()
+    assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=asymptotic_frontier_worker,
+            args=(rank, pod_index, result_queue),
+        )
+        for rank in range(visible)
+    ]
+    for process in processes:
+        process.start()
+    shards = []
+    while len(shards) < len(processes):
+        try:
+            shards.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            failed = [p.exitcode for p in processes if p.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"asymptotic worker failed: {failed}")
+            print(
+                f"ASYMPTOTIC_PROGRESS replica={pod_index} "
+                f"finished={len(shards)}/{len(processes)}",
+                flush=True,
+            )
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+
+    combined_top = [row for shard in shards for row in shard["top"]]
+    combined_top.sort(key=lambda row: row["C_float"], reverse=True)
+    combined_checkpoints = [
+        row for shard in shards for row in shard["checkpoints"]
+    ]
+    checkpoint_winners = []
+    for depth in sorted(ASYMPTOTIC_CHECKPOINTS):
+        checkpoint_winners.append(
+            max(
+                (row for row in combined_checkpoints if row["d"] == depth),
+                key=lambda row: row["C_float"],
+            )
+        )
+    t_values = improved_t_values(2048)
+    result = {
+        "top": [
+            exact_asymptotic_row(row, t_values)
+            for row in combined_top[:64]
+        ],
+        "checkpoints": [
+            exact_asymptotic_row(row, t_values)
+            for row in checkpoint_winners
+        ],
+    }
+    print(
+        "ASYMPTOTIC_FRONTIER_EXACT " + json.dumps(result, sort_keys=True),
+        flush=True,
+    )
+    return result
+
+
 def main() -> None:
     pod_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
     print(
@@ -1120,10 +1297,10 @@ def main() -> None:
         flush=True,
     )
 
-    frontier_rows = run_parameter_frontier(pod_index)
+    asymptotic = run_asymptotic_frontier(pod_index)
     print(
-        "PARAMETER_FRONTIER_SUMMARY "
-        + json.dumps(frontier_rows, sort_keys=True),
+        "ASYMPTOTIC_FRONTIER_SUMMARY "
+        + json.dumps(asymptotic, sort_keys=True),
         flush=True,
     )
 
@@ -1139,10 +1316,10 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "parameter_s_max": 10_000_000,
-        "parameter_d_max": 256,
-        "frontier_best": frontier_rows[0],
-        "frontier_exact_rows": len(frontier_rows),
+        "asymptotic_d_max": 2048,
+        "asymptotic_log_s_max": 100.0,
+        "asymptotic_best": asymptotic["top"][0],
+        "asymptotic_checkpoints": asymptotic["checkpoints"],
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],
         "largest_C_certificate": certificates[-1]["C_certificate"],

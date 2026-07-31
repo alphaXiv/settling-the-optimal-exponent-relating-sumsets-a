@@ -49,3 +49,7 @@ The parameter-frontier child drops the special restriction `s=2^K+1` and
 searches every odd `s` coprime to 12 up to ten million, for digit depths
 through 256. It evaluates the exact infinite-block formula on GPUs and
 rechecks the leading candidates with arbitrary-precision integers.
+
+The asymptotic-depth child extends this optimization through depth 2048 on a
+dense logarithmic `s` grid, snaps the floating candidates to valid integers,
+and exact-checks both the global leaders and fixed-depth checkpoints.
