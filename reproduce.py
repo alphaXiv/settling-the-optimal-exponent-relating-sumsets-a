@@ -1314,7 +1314,7 @@ def deep_scaling_worker(
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    grid_size = 128_000_000
+    grid_size = 16_000_000
     full_grid = torch.linspace(
         100000.0, 413000.0, grid_size, dtype=torch.float64, device=device
     )
@@ -1579,7 +1579,7 @@ def main() -> None:
         "improved_depth_multiplier": 15,
         "deep_d_max": DEEP_MAXIMUM,
         "deep_log_s_max": 413000.0,
-        "deep_grid_size": 128_000_000,
+        "deep_grid_size": 16_000_000,
         "predicted_scaled_gap_limit": predicted_scaled_gap_limit(),
         "deep_best": deep_scaling["top"][0],
         "deep_checkpoints": deep_scaling["checkpoints"],

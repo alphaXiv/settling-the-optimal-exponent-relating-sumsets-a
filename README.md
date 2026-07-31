@@ -77,4 +77,4 @@ dominant-root log-growth model calibrated against an exact recurrence value,
 while the parent concurrently computes exact counts for every candidate depth.
 
 The eight-million-depth child quadruples this range once more, using a
-128-million-point grid and exact checkpoints through depth 8388608.
+16-million-point grid and exact checkpoints through depth 8388608.
