@@ -28,3 +28,9 @@ constructs the reachable carry-subset automaton for every minimizer, and ranks
 its Perron growth factor normalized by the base. Both eight-GPU nodes repeat
 the complete sweep, providing an independent cross-node replication while the
 leader prints the complete result table.
+
+The improved-construction child promotes the best gadget
+`{0,1,3,4,5,8}`. It checks an exact rational Perron certificate reducing the
+paper's digit depth from `22(K+2)` to `15(K+2)`, and uses GPU FFTs to count
+the actual integer sumsets and difference sets for original/improved toy CRT
+constructions.

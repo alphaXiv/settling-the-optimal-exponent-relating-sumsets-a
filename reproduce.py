@@ -22,6 +22,7 @@ from typing import Iterable
 
 
 W = frozenset({0, 1, 2, 4, 5, 9})
+IMPROVED_W = frozenset({0, 1, 3, 4, 5, 8})
 DELTA = frozenset(
     {-9, -8, -7, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 7, 8, 9}
 )
@@ -256,6 +257,77 @@ def theorem_certificates() -> list[dict]:
     return rows
 
 
+def improved_theorem_certificates() -> tuple[dict, list[dict]]:
+    automaton = carry_automaton_metrics(sorted(IMPROVED_W), 12)
+    matrix = automaton["transition_matrix"]
+    expected_matrix = [[7, 2, 2], [6, 4, 2], [6, 3, 3]]
+    assert matrix == expected_matrix
+
+    # Exact Collatz--Wielandt upper certificate:
+    # M v <= r v for v=(1,53/48,53/48), r=183/16.
+    vector = (Fraction(1), Fraction(53, 48), Fraction(53, 48))
+    rational_radius = Fraction(183, 16)
+    matrix_vector = tuple(
+        sum(Fraction(matrix[row][col]) * vector[col] for col in range(3))
+        for row in range(3)
+    )
+    assert all(
+        matrix_vector[index] <= rational_radius * vector[index]
+        for index in range(3)
+    )
+    normalized = rational_radius / 12
+    assert normalized == Fraction(61, 64)
+    assert normalized**15 < Fraction(1, 2)
+
+    counts = automaton["t_0_to_8"]
+    for j, count in enumerate(counts):
+        assert count <= rational_radius**j
+    for j in range(6):
+        if len(counts) <= j + 3:
+            break
+        assert (
+            counts[j + 3]
+            == 14 * counts[j + 2] - 31 * counts[j + 1] + 18 * counts[j]
+        )
+
+    rows = []
+    for k_value in range(2, 98, 2):
+        d = 15 * (k_value + 2)
+        s = 2**k_value + 1
+        q_outer = s * s
+        rho = 2 * s - 1
+        alpha = Fraction(2 ** (k_value + 1), 2**d)
+        beta_upper = normalized**d
+        assert alpha < Fraction(1, 2)
+        assert beta_upper < Fraction(1, 2 ** (k_value + 2))
+        assert q_outer * beta_upper < Fraction(s, 2)
+        rows.append(
+            {
+                "K": k_value,
+                "d_improved": d,
+                "d_paper": 22 * (k_value + 2),
+                "depth_reduction_fraction": Fraction(7, 22),
+                "alpha_log2": k_value + 1 - d,
+                "beta_upper_log2": float(
+                    d * math.log2(float(normalized))
+                ),
+            }
+        )
+    certificate = {
+        "digits": sorted(IMPROVED_W),
+        "transition_matrix": matrix,
+        "t_0_to_8": counts,
+        "characteristic_recurrence": "t[j+3]=14t[j+2]-31t[j+1]+18t[j]",
+        "collatz_vector": [str(value) for value in vector],
+        "rational_radius_bound": str(rational_radius),
+        "normalized_bound": str(normalized),
+        "normalized_bound_power_15": str(normalized**15),
+        "computed_spectral_radius": automaton["spectral_radius"],
+        "computed_normalized_growth": automaton["normalized_growth"],
+    }
+    return certificate, rows
+
+
 def rotate_left(values, shift: int, bits: int, full_mask: int):
     if shift == 0:
         return values
@@ -467,6 +539,150 @@ def run_gpu_search(pod_index: int) -> list[dict]:
     return sorted(results, key=lambda row: row["base"])
 
 
+def custom_digit_set(depth: int, digits: Iterable[int], base: int = 12) -> set[int]:
+    values = {0}
+    place = 1
+    digit_tuple = tuple(digits)
+    for _ in range(depth):
+        values = {x + digit * place for x in values for digit in digit_tuple}
+        place *= base
+    return values
+
+
+def build_crt_set(k_value: int, depth: int, digits: Iterable[int]) -> tuple:
+    s, q_outer, i_set, b_set = cyclic_basis(k_value)
+    n = 12**depth
+    q_total = q_outer * n
+    y = custom_digit_set(depth, digits)
+    inverse_q = pow(q_outer, -1, n)
+    r_set = {q_outer * inner for inner in range(n)}
+    for outer in b_set:
+        for inner in y:
+            lift = outer + q_outer * (((inner - outer) * inverse_q) % n)
+            r_set.add(lift)
+    assert len(r_set) == n + (len(i_set) - 1) * len(y)
+    return s, q_outer, len(i_set), n, q_total, y, r_set
+
+
+def fft_support_counts(a_set: set[int], device) -> tuple[int, int, int]:
+    import torch
+
+    maximum = max(a_set)
+    transform_length = 1 << (2 * maximum + 1).bit_length()
+    indicator = torch.zeros(
+        transform_length, dtype=torch.float64, device=device
+    )
+    indices = torch.tensor(sorted(a_set), dtype=torch.int64, device=device)
+    indicator[indices] = 1.0
+    frequency = torch.fft.rfft(indicator)
+    sum_convolution = torch.fft.irfft(
+        frequency * frequency, n=transform_length
+    )
+    diff_correlation = torch.fft.irfft(
+        frequency * torch.conj(frequency), n=transform_length
+    )
+    sum_count = int((sum_convolution > 0.5).sum().item())
+    diff_count = int((diff_correlation > 0.5).sum().item())
+    del indicator, indices, frequency, sum_convolution, diff_correlation
+    torch.cuda.empty_cache()
+    return transform_length, sum_count, diff_count
+
+
+def fft_comparison_worker(local_rank: int, pod_index: int, result_queue) -> None:
+    import torch
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    k_value = 2 if local_rank < 4 else 4
+    depth = local_rank % 4 + 1
+    case_rows = []
+    started = time.time()
+    for label, digits in (("paper", W), ("improved", IMPROVED_W)):
+        s, q_outer, rho, n, q_total, y, r_set = build_crt_set(
+            k_value, depth, digits
+        )
+        a_set = r_set | {value + q_total for value in r_set}
+        transform_length, sum_count, diff_count = fft_support_counts(
+            a_set, device
+        )
+        t_value = len(modular_diffset(y, y, n))
+        modular_diff_formula = rho * n + (q_outer - rho) * t_value
+        assert sum_count >= 3 * q_total
+        assert diff_count <= 4 * modular_diff_formula
+        sigma = Fraction(sum_count, len(a_set))
+        delta = Fraction(diff_count, len(a_set))
+        c_value = math.log(float(sigma)) / math.log(float(delta))
+        row = {
+            "replica": pod_index,
+            "gpu": local_rank,
+            "gadget": label,
+            "digits": sorted(digits),
+            "K": k_value,
+            "d": depth,
+            "Q": q_outer,
+            "n": n,
+            "|Y-Y mod n|": t_value,
+            "|R|": len(r_set),
+            "|A|": len(a_set),
+            "|A+A|": sum_count,
+            "|A-A|": diff_count,
+            "sigma": float(sigma),
+            "delta": float(delta),
+            "C": c_value,
+            "fft_length": transform_length,
+        }
+        print("FFT_INTEGER_CASE " + json.dumps(row, sort_keys=True), flush=True)
+        case_rows.append(row)
+    result = {
+        "replica": pod_index,
+        "gpu": local_rank,
+        "K": k_value,
+        "d": depth,
+        "paper": case_rows[0],
+        "improved": case_rows[1],
+        "delta_C": case_rows[1]["C"] - case_rows[0]["C"],
+        "seconds": time.time() - started,
+        "device": torch.cuda.get_device_name(local_rank),
+    }
+    print("FFT_COMPARISON_RESULT " + json.dumps(result, sort_keys=True), flush=True)
+    result_queue.put(result)
+
+
+def run_fft_comparisons(pod_index: int) -> list[dict]:
+    import torch
+
+    visible = torch.cuda.device_count()
+    assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=fft_comparison_worker,
+            args=(rank, pod_index, result_queue),
+        )
+        for rank in range(visible)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    while len(results) < len(processes):
+        try:
+            results.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            failed = [p.exitcode for p in processes if p.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"FFT comparison worker failed: {failed}")
+            print(
+                f"FFT_PROGRESS replica={pod_index} "
+                f"finished={len(results)}/{len(processes)}",
+                flush=True,
+            )
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+    return sorted(results, key=lambda row: (row["K"], row["d"]))
+
+
 def main() -> None:
     pod_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
     print(
@@ -503,22 +719,44 @@ def main() -> None:
     ]
     print("THEOREM_CERTIFICATES " + json.dumps(selected, sort_keys=True), flush=True)
 
-    gpu_rows = run_gpu_search(pod_index)
-    print("GPU_SEARCH_SUMMARY " + json.dumps(gpu_rows, sort_keys=True), flush=True)
+    improved_certificate, improved_rows = improved_theorem_certificates()
+    print(
+        "IMPROVED_THEOREM_CERTIFICATE "
+        + json.dumps(improved_certificate, sort_keys=True),
+        flush=True,
+    )
+    print(
+        "IMPROVED_DEPTH_ROWS "
+        + json.dumps(
+            [
+                row
+                for row in improved_rows
+                if row["K"] in {2, 4, 8, 16, 32, 64, 96}
+            ],
+            sort_keys=True,
+            default=str,
+        ),
+        flush=True,
+    )
+
+    fft_rows = run_fft_comparisons(pod_index)
+    print("FFT_COMPARISON_SUMMARY " + json.dumps(fft_rows, sort_keys=True), flush=True)
 
     summary = {
         "status": "PASS",
         "pod_index": pod_index,
         "exact_claim_groups_passed": 6,
         "theorem_K_values_checked": len(certificates),
-        "gpu_moduli_checked": [row["base"] for row in gpu_rows],
-        "best_neighboring_gadget": min(
-            (
-                row["best_carry_automaton"]["normalized_growth"],
-                row["base"],
-                row["best_carry_digits"],
-            )
-            for row in gpu_rows
+        "improved_gadget": sorted(IMPROVED_W),
+        "paper_normalized_growth": gadget["lambda_over_12"],
+        "improved_normalized_growth": improved_certificate[
+            "computed_normalized_growth"
+        ],
+        "paper_depth_multiplier": 22,
+        "improved_depth_multiplier": 15,
+        "fft_cases_checked": 2 * len(fft_rows),
+        "fft_improved_C_wins": sum(
+            row["delta_C"] > 0 for row in fft_rows
         ),
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],
