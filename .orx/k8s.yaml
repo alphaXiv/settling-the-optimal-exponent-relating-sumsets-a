@@ -13,7 +13,7 @@ spec:
       containers:
         - name: reproduce
           image: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
-          command: ["bash", "-c", "$ORX_SCRIPT"]
+          command: ["bash", "-c", "eval \"$ORX_SCRIPT\""]
           env:
             - name: JOB_COMPLETION_INDEX
               valueFrom:
