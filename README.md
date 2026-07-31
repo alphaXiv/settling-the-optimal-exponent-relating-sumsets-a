@@ -63,3 +63,7 @@ The ultra-deep child extends the frontier to depth 32768 on an eight-million
 point grid.  It derives every logarithmic digit-growth factor from the exact
 integer recurrence, avoiding both underflow and cancellation, and constructs
 the enormous admissible outer parameters with arbitrary-precision decimals.
+
+The convergence-constant child pushes to depth 131072 with a sixteen-million
+point grid and reports the scaled gap `d(2-C)`, which should approach a finite
+constant if the optimized exponent converges to two at rate `1/d`.
