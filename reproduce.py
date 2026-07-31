@@ -791,6 +791,134 @@ def run_block_lift_audit(pod_index: int) -> list[dict]:
     return sorted(results, key=lambda row: (row["K"], row["d"]))
 
 
+INFINITE_BLOCK_CASES = (
+    (2, 5),
+    (2, 6),
+    (4, 5),
+    (6, 1),
+    (6, 2),
+    (6, 3),
+    (8, 1),
+    (8, 2),
+)
+
+
+def infinite_block_worker(local_rank: int, pod_index: int, result_queue) -> None:
+    import torch
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    k_value, depth = INFINITE_BLOCK_CASES[local_rank]
+    s, q_outer, rho, n, q_total, y, r_set = build_crt_set(
+        k_value, depth, IMPROVED_W
+    )
+    improved_counts = carry_automaton_metrics(sorted(IMPROVED_W), 12)[
+        "t_0_to_8"
+    ]
+    t_value = improved_counts[depth]
+    if depth <= 4:
+        assert t_value == len(modular_diffset(y, y, n))
+    modular_diff_count = rho * n + (q_outer - rho) * t_value
+
+    transform_length, sum_count_h1, diff_count_h1 = fft_support_counts(
+        r_set, device
+    )
+    two_quotient_sum_fibers = sum_count_h1 - q_total
+    two_quotient_diff_fibers = diff_count_h1 - modular_diff_count
+    assert 0 <= two_quotient_sum_fibers <= q_total
+    assert 0 <= two_quotient_diff_fibers <= modular_diff_count
+
+    def affine_row(block_count: int) -> dict:
+        sum_count = (
+            q_total * (2 * block_count - 1) + two_quotient_sum_fibers
+        )
+        diff_count = (
+            modular_diff_count * (2 * block_count - 1)
+            + two_quotient_diff_fibers
+        )
+        cardinality = block_count * len(r_set)
+        sigma = Fraction(sum_count, cardinality)
+        delta = Fraction(diff_count, cardinality)
+        return {
+            "h": block_count,
+            "|A_h|": cardinality,
+            "|A_h+A_h|": sum_count,
+            "|A_h-A_h|": diff_count,
+            "sigma": float(sigma),
+            "delta": float(delta),
+            "C": math.log(float(sigma)) / math.log(float(delta)),
+        }
+
+    h_values = (1, 2, 4, 8, 16, 32, 64, 128, 1024, 1_000_000)
+    rows = [affine_row(block_count) for block_count in h_values]
+    sigma_limit = Fraction(2 * q_total, len(r_set))
+    delta_limit = Fraction(2 * modular_diff_count, len(r_set))
+    c_limit = math.log(float(sigma_limit)) / math.log(float(delta_limit))
+    assert all(
+        rows[index]["C"] >= rows[index - 1]["C"]
+        for index in range(1, len(rows))
+    )
+    assert c_limit >= rows[-1]["C"]
+    result = {
+        "replica": pod_index,
+        "gpu": local_rank,
+        "K": k_value,
+        "d": depth,
+        "Q": q_outer,
+        "n": n,
+        "|R|": len(r_set),
+        "q": q_total,
+        "modular_difference_count": modular_diff_count,
+        "two_quotient_sum_fibers": two_quotient_sum_fibers,
+        "two_quotient_diff_fibers": two_quotient_diff_fibers,
+        "fft_length": transform_length,
+        "rows": rows,
+        "sigma_limit": float(sigma_limit),
+        "delta_limit": float(delta_limit),
+        "C_limit": c_limit,
+        "gain_limit_over_h2": c_limit - rows[1]["C"],
+        "gap_h1e6_to_limit": c_limit - rows[-1]["C"],
+        "device": torch.cuda.get_device_name(local_rank),
+    }
+    print("INFINITE_BLOCK_RESULT " + json.dumps(result, sort_keys=True), flush=True)
+    result_queue.put(result)
+
+
+def run_infinite_block_audit(pod_index: int) -> list[dict]:
+    import torch
+
+    visible = torch.cuda.device_count()
+    assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=infinite_block_worker,
+            args=(rank, pod_index, result_queue),
+        )
+        for rank in range(visible)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    while len(results) < len(processes):
+        try:
+            results.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            failed = [p.exitcode for p in processes if p.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"infinite-block worker failed: {failed}")
+            print(
+                f"INFINITE_BLOCK_PROGRESS replica={pod_index} "
+                f"finished={len(results)}/{len(processes)}",
+                flush=True,
+            )
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+    return sorted(results, key=lambda row: (row["K"], row["d"]))
+
+
 def main() -> None:
     pod_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
     print(
@@ -847,9 +975,9 @@ def main() -> None:
         flush=True,
     )
 
-    block_rows = run_block_lift_audit(pod_index)
+    block_rows = run_infinite_block_audit(pod_index)
     print(
-        "BLOCK_LIFT_SUMMARY " + json.dumps(block_rows, sort_keys=True),
+        "INFINITE_BLOCK_SUMMARY " + json.dumps(block_rows, sort_keys=True),
         flush=True,
     )
 
@@ -865,10 +993,13 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "block_lift_cases_checked": 8 * len(block_rows),
-        "block_lift_best_h_values": [row["best_h"] for row in block_rows],
-        "block_lift_monotone_cases": sum(
-            row["monotone_through_h8"] for row in block_rows
+        "infinite_block_cases_checked": len(block_rows),
+        "all_block_grids_monotone": all(
+            row["C_limit"] >= row["rows"][-1]["C"] for row in block_rows
+        ),
+        "best_limit_C": max(row["C_limit"] for row in block_rows),
+        "largest_limit_gain_over_h2": max(
+            row["gain_limit_over_h2"] for row in block_rows
         ),
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],

@@ -39,3 +39,8 @@ The multi-block child generalizes the final integer lift to
 `A_h = R + q{0,...,h-1}`. It checks the generalized lift constants and scans
 `h=1,...,8` with exact GPU FFT support counts to measure which finite lift
 maximizes the exponent ratio.
+
+The infinite-block child observes that both support counts are exactly affine
+in `h`. It measures the two intercepts with one exact FFT per construction,
+then evaluates arbitrarily large block widths and the closed-form
+`h -> infinity` exponent limit for substantially deeper/larger CRT cases.
