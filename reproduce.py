@@ -1241,6 +1241,171 @@ def run_asymptotic_frontier(pod_index: int) -> dict:
     return result
 
 
+DEEP_CHECKPOINTS = frozenset({4096, 6144, 8192})
+
+
+def deep_scaling_worker(local_rank: int, pod_index: int, result_queue) -> None:
+    import torch
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    grid_size = 2_000_000
+    full_grid = torch.linspace(
+        90.0, 450.0, grid_size, dtype=torch.float64, device=device
+    )
+    log_s_values = full_grid[local_rank::8]
+    beta_values = [1.0, 11.0 / 12.0, 125.0 / (12.0**2)]
+    while len(beta_values) <= 8192:
+        beta_values.append(
+            (14.0 / 12.0) * beta_values[-1]
+            - (31.0 / (12.0**2)) * beta_values[-2]
+            + (18.0 / (12.0**3)) * beta_values[-3]
+        )
+
+    best_rows = []
+    checkpoints = []
+    log_two = math.log(2)
+    started = time.time()
+    for depth in range(2049, 8193):
+        log_beta = math.log(beta_values[depth])
+        # At log(s)>=90, replacing log(2s-2) by log(2s) and
+        # log(s^2-2s+1) by 2log(s) changes less than 1e-38.
+        log_alpha = log_two + log_s_values - depth * log_two
+        log_denominator = torch.nn.functional.softplus(log_alpha)
+        log_sigma = log_two + 2 * log_s_values - log_denominator
+        log_inner = torch.logaddexp(
+            log_two + log_s_values,
+            2 * log_s_values + log_beta,
+        )
+        log_delta = log_two + log_inner - log_denominator
+        c_values = log_sigma / log_delta
+        value, index = torch.max(c_values, dim=0)
+        row = {
+            "replica": pod_index,
+            "gpu": local_rank,
+            "log_s": float(log_s_values[index].item()),
+            "d": depth,
+            "C_float": float(value.item()),
+            "log_sigma_float": float(log_sigma[index].item()),
+            "log_delta_float": float(log_delta[index].item()),
+        }
+        best_rows.append(row)
+        if depth in DEEP_CHECKPOINTS:
+            checkpoints.append(row)
+
+    best_rows.sort(key=lambda row: row["C_float"], reverse=True)
+    result = {
+        "replica": pod_index,
+        "gpu": local_rank,
+        "log_s_samples": int(log_s_values.numel()),
+        "depth_count": 8192 - 2048,
+        "top": best_rows[:16],
+        "checkpoints": checkpoints,
+        "seconds": time.time() - started,
+        "device": torch.cuda.get_device_name(local_rank),
+    }
+    print("DEEP_SCALING_SHARD " + json.dumps(result, sort_keys=True), flush=True)
+    result_queue.put(result)
+
+
+def log_bigint(value: int) -> float:
+    assert value > 0
+    shift = max(0, value.bit_length() - 53)
+    return math.log(value >> shift) + shift * math.log(2)
+
+
+def exact_deep_row(row: dict, t_values: list[int]) -> dict:
+    s_float = math.exp(row["log_s"])
+    s = nearest_admissible_s(s_float)
+    depth = row["d"]
+    q_outer = s * s
+    rho = 2 * s - 1
+    n = 12**depth
+    r_size = n + (rho - 1) * 6**depth
+    modular_diff_count = rho * n + (q_outer - rho) * t_values[depth]
+    log_sigma = (
+        math.log(2)
+        + log_bigint(q_outer)
+        + log_bigint(n)
+        - log_bigint(r_size)
+    )
+    log_delta = (
+        math.log(2)
+        + log_bigint(modular_diff_count)
+        - log_bigint(r_size)
+    )
+    c_exact = log_sigma / log_delta
+    assert abs(c_exact - row["C_float"]) < 1e-7
+    return {
+        **row,
+        "s": s,
+        "C_exact": c_exact,
+        "gap_to_2": 2 - c_exact,
+        "log_sigma_exact": log_sigma,
+        "log_delta_exact": log_delta,
+        "|R|_digits": int(log_bigint(r_size) / math.log(10)) + 1,
+        "gcd_s_12": math.gcd(s, 12),
+    }
+
+
+def run_deep_scaling(pod_index: int) -> dict:
+    import torch
+
+    visible = torch.cuda.device_count()
+    assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=deep_scaling_worker,
+            args=(rank, pod_index, result_queue),
+        )
+        for rank in range(visible)
+    ]
+    for process in processes:
+        process.start()
+    shards = []
+    while len(shards) < len(processes):
+        try:
+            shards.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            failed = [p.exitcode for p in processes if p.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"deep-scaling worker failed: {failed}")
+            print(
+                f"DEEP_SCALING_PROGRESS replica={pod_index} "
+                f"finished={len(shards)}/{len(processes)}",
+                flush=True,
+            )
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+
+    combined_top = [row for shard in shards for row in shard["top"]]
+    combined_top.sort(key=lambda row: row["C_float"], reverse=True)
+    combined_checkpoints = [
+        row for shard in shards for row in shard["checkpoints"]
+    ]
+    checkpoint_winners = [
+        max(
+            (row for row in combined_checkpoints if row["d"] == depth),
+            key=lambda row: row["C_float"],
+        )
+        for depth in sorted(DEEP_CHECKPOINTS)
+    ]
+    t_values = improved_t_values(8192)
+    result = {
+        "top": [
+            exact_deep_row(row, t_values) for row in combined_top[:64]
+        ],
+        "checkpoints": [
+            exact_deep_row(row, t_values) for row in checkpoint_winners
+        ],
+    }
+    print("DEEP_SCALING_EXACT " + json.dumps(result, sort_keys=True), flush=True)
+    return result
+
+
 def main() -> None:
     pod_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
     print(
@@ -1297,10 +1462,10 @@ def main() -> None:
         flush=True,
     )
 
-    asymptotic = run_asymptotic_frontier(pod_index)
+    deep_scaling = run_deep_scaling(pod_index)
     print(
-        "ASYMPTOTIC_FRONTIER_SUMMARY "
-        + json.dumps(asymptotic, sort_keys=True),
+        "DEEP_SCALING_SUMMARY "
+        + json.dumps(deep_scaling, sort_keys=True),
         flush=True,
     )
 
@@ -1316,10 +1481,11 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "asymptotic_d_max": 2048,
-        "asymptotic_log_s_max": 100.0,
-        "asymptotic_best": asymptotic["top"][0],
-        "asymptotic_checkpoints": asymptotic["checkpoints"],
+        "deep_d_max": 8192,
+        "deep_log_s_max": 450.0,
+        "deep_grid_size": 2_000_000,
+        "deep_best": deep_scaling["top"][0],
+        "deep_checkpoints": deep_scaling["checkpoints"],
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],
         "largest_C_certificate": certificates[-1]["C_certificate"],

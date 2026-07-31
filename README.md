@@ -53,3 +53,8 @@ rechecks the leading candidates with arbitrary-precision integers.
 The asymptotic-depth child extends this optimization through depth 2048 on a
 dense logarithmic `s` grid, snaps the floating candidates to valid integers,
 and exact-checks both the global leaders and fixed-depth checkpoints.
+
+The deep-scaling child uses a two-million-point log grid through depth 8192.
+All objective calculations stay in the log domain, and exact verification uses
+bit-length logarithms so even thousand-digit construction parameters do not
+overflow floating point.
