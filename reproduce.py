@@ -578,12 +578,13 @@ def fft_support_counts(a_set: set[int], device) -> tuple[int, int, int]:
     sum_convolution = torch.fft.irfft(
         frequency * frequency, n=transform_length
     )
+    sum_count = int((sum_convolution > 0.5).sum().item())
+    del sum_convolution
     diff_correlation = torch.fft.irfft(
         frequency * torch.conj(frequency), n=transform_length
     )
-    sum_count = int((sum_convolution > 0.5).sum().item())
     diff_count = int((diff_correlation > 0.5).sum().item())
-    del indicator, indices, frequency, sum_convolution, diff_correlation
+    del indicator, indices, frequency, diff_correlation
     torch.cuda.empty_cache()
     return transform_length, sum_count, diff_count
 
@@ -683,6 +684,113 @@ def run_fft_comparisons(pod_index: int) -> list[dict]:
     return sorted(results, key=lambda row: (row["K"], row["d"]))
 
 
+def block_lift_worker(local_rank: int, pod_index: int, result_queue) -> None:
+    import torch
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    k_value = 2 if local_rank < 4 else 4
+    depth = local_rank % 4 + 1
+    s, q_outer, rho, n, q_total, y, r_set = build_crt_set(
+        k_value, depth, IMPROVED_W
+    )
+    t_value = len(modular_diffset(y, y, n))
+    modular_diff_formula = rho * n + (q_outer - rho) * t_value
+    rows = []
+    started = time.time()
+    for block_count in range(1, 9):
+        a_set = {
+            value + block * q_total
+            for block in range(block_count)
+            for value in r_set
+        }
+        assert len(a_set) == block_count * len(r_set)
+        transform_length, sum_count, diff_count = fft_support_counts(
+            a_set, device
+        )
+        assert sum_count >= (2 * block_count - 1) * q_total
+        assert diff_count <= 2 * block_count * modular_diff_formula
+        sigma = Fraction(sum_count, len(a_set))
+        delta = Fraction(diff_count, len(a_set))
+        c_value = math.log(float(sigma)) / math.log(float(delta))
+        row = {
+            "replica": pod_index,
+            "gpu": local_rank,
+            "K": k_value,
+            "d": depth,
+            "h": block_count,
+            "Q": q_outer,
+            "n": n,
+            "|R|": len(r_set),
+            "|A_h|": len(a_set),
+            "|A_h+A_h|": sum_count,
+            "|A_h-A_h|": diff_count,
+            "sigma": float(sigma),
+            "delta": float(delta),
+            "C": c_value,
+            "sum_lift_per_residue_lower": 2 * block_count - 1,
+            "diff_lift_per_residue_upper": 2 * block_count,
+            "fft_length": transform_length,
+        }
+        print("BLOCK_LIFT_CASE " + json.dumps(row, sort_keys=True), flush=True)
+        rows.append(row)
+    best = max(rows, key=lambda row: row["C"])
+    result = {
+        "replica": pod_index,
+        "gpu": local_rank,
+        "K": k_value,
+        "d": depth,
+        "best_h": best["h"],
+        "best_C": best["C"],
+        "C_at_h2": rows[1]["C"],
+        "gain_over_h2": best["C"] - rows[1]["C"],
+        "monotone_through_h8": all(
+            rows[index]["C"] >= rows[index - 1]["C"]
+            for index in range(1, len(rows))
+        ),
+        "rows": rows,
+        "seconds": time.time() - started,
+        "device": torch.cuda.get_device_name(local_rank),
+    }
+    print("BLOCK_LIFT_RESULT " + json.dumps(result, sort_keys=True), flush=True)
+    result_queue.put(result)
+
+
+def run_block_lift_audit(pod_index: int) -> list[dict]:
+    import torch
+
+    visible = torch.cuda.device_count()
+    assert visible == 8, f"manifest promised 8 visible GPUs, found {visible}"
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=block_lift_worker,
+            args=(rank, pod_index, result_queue),
+        )
+        for rank in range(visible)
+    ]
+    for process in processes:
+        process.start()
+    results = []
+    while len(results) < len(processes):
+        try:
+            results.append(result_queue.get(timeout=30))
+        except queue.Empty:
+            failed = [p.exitcode for p in processes if p.exitcode not in (None, 0)]
+            if failed:
+                raise RuntimeError(f"block-lift worker failed: {failed}")
+            print(
+                f"BLOCK_LIFT_PROGRESS replica={pod_index} "
+                f"finished={len(results)}/{len(processes)}",
+                flush=True,
+            )
+    for process in processes:
+        process.join()
+        assert process.exitcode == 0
+    return sorted(results, key=lambda row: (row["K"], row["d"]))
+
+
 def main() -> None:
     pod_index = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
     print(
@@ -739,8 +847,11 @@ def main() -> None:
         flush=True,
     )
 
-    fft_rows = run_fft_comparisons(pod_index)
-    print("FFT_COMPARISON_SUMMARY " + json.dumps(fft_rows, sort_keys=True), flush=True)
+    block_rows = run_block_lift_audit(pod_index)
+    print(
+        "BLOCK_LIFT_SUMMARY " + json.dumps(block_rows, sort_keys=True),
+        flush=True,
+    )
 
     summary = {
         "status": "PASS",
@@ -754,9 +865,10 @@ def main() -> None:
         ],
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
-        "fft_cases_checked": 2 * len(fft_rows),
-        "fft_improved_C_wins": sum(
-            row["delta_C"] > 0 for row in fft_rows
+        "block_lift_cases_checked": 8 * len(block_rows),
+        "block_lift_best_h_values": [row["best_h"] for row in block_rows],
+        "block_lift_monotone_cases": sum(
+            row["monotone_through_h8"] for row in block_rows
         ),
         "paper_W_difference_size": 11,
         "toy_C": toy["C"],

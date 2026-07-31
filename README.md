@@ -34,3 +34,8 @@ The improved-construction child promotes the best gadget
 paper's digit depth from `22(K+2)` to `15(K+2)`, and uses GPU FFTs to count
 the actual integer sumsets and difference sets for original/improved toy CRT
 constructions.
+
+The multi-block child generalizes the final integer lift to
+`A_h = R + q{0,...,h-1}`. It checks the generalized lift constants and scans
+`h=1,...,8` with exact GPU FFT support counts to measure which finite lift
+maximizes the exponent ratio.
