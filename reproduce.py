@@ -1241,8 +1241,8 @@ def run_asymptotic_frontier(pod_index: int) -> dict:
     return result
 
 
-DEEP_MAXIMUM = 2_097_152
-DEEP_CHECKPOINTS = frozenset({1_048_576, 1_572_864, DEEP_MAXIMUM})
+DEEP_MAXIMUM = 8_388_608
+DEEP_CHECKPOINTS = frozenset({4_194_304, 6_291_456, DEEP_MAXIMUM})
 
 
 def improved_perron_root() -> float:
@@ -1314,9 +1314,9 @@ def deep_scaling_worker(
 
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    grid_size = 64_000_000
+    grid_size = 128_000_000
     full_grid = torch.linspace(
-        25000.0, 104000.0, grid_size, dtype=torch.float64, device=device
+        100000.0, 413000.0, grid_size, dtype=torch.float64, device=device
     )
     log_s_values = full_grid[local_rank::8]
 
@@ -1324,7 +1324,7 @@ def deep_scaling_worker(
     checkpoints = []
     log_two = math.log(2)
     started = time.time()
-    for depth in range(524289, DEEP_MAXIMUM + 1):
+    for depth in range(2_097_153, DEEP_MAXIMUM + 1):
         log_beta = log_beta_intercept + depth * log_beta_slope
         # At log(s)>=90, replacing log(2s-2) by log(2s) and
         # log(s^2-2s+1) by 2log(s) changes less than 1e-38.
@@ -1356,7 +1356,7 @@ def deep_scaling_worker(
         "replica": pod_index,
         "gpu": local_rank,
         "log_s_samples": int(log_s_values.numel()),
-        "depth_count": DEEP_MAXIMUM - 524288,
+        "depth_count": DEEP_MAXIMUM - 2_097_152,
         "top": best_rows[:16],
         "checkpoints": checkpoints,
         "seconds": time.time() - started,
@@ -1578,8 +1578,8 @@ def main() -> None:
         "paper_depth_multiplier": 22,
         "improved_depth_multiplier": 15,
         "deep_d_max": DEEP_MAXIMUM,
-        "deep_log_s_max": 104000.0,
-        "deep_grid_size": 64_000_000,
+        "deep_log_s_max": 413000.0,
+        "deep_grid_size": 128_000_000,
         "predicted_scaled_gap_limit": predicted_scaled_gap_limit(),
         "deep_best": deep_scaling["top"][0],
         "deep_checkpoints": deep_scaling["checkpoints"],

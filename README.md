@@ -75,3 +75,6 @@ the exact characteristic polynomial of the improved carry automaton.
 The million-depth child reaches depth 2097152.  Its GPU search uses the
 dominant-root log-growth model calibrated against an exact recurrence value,
 while the parent concurrently computes exact counts for every candidate depth.
+
+The eight-million-depth child quadruples this range once more, using a
+128-million-point grid and exact checkpoints through depth 8388608.
