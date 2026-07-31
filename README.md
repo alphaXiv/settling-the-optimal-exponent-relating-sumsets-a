@@ -58,3 +58,8 @@ The deep-scaling child uses a two-million-point log grid through depth 8192.
 All objective calculations stay in the log domain, and exact verification uses
 bit-length logarithms so even thousand-digit construction parameters do not
 overflow floating point.
+
+The ultra-deep child extends the frontier to depth 32768 on an eight-million
+point grid.  It derives every logarithmic digit-growth factor from the exact
+integer recurrence, avoiding both underflow and cancellation, and constructs
+the enormous admissible outer parameters with arbitrary-precision decimals.
